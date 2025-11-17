@@ -1,32 +1,11 @@
-# Build / cache artifacts
-out/
-cache/
-broadcast/
-coverage/
-lcov.info
+# Ignore everything by default
+*
 
-# Foundry / Forge ephemeral
-**/forge-artifacts/
-.forge-*
-
-# Node / JS dependencies inside vendored libs (if any)
-node_modules/
-
-# OS / editor noise
-.DS_Store
-*.swp
-*.swo
-.idea/
-.vscode/
-
-# Logs / temp
-*.log
-/tmp/
-
-# Reports
-reports/
-
-# Ignore large vendored test trees from OpenZeppelin JS (optional uncomment)
-# lib/openzeppelin-contracts/test/
-# lib/openzeppelin-contracts/scripts/
-# lib/openzeppelin-contracts/.github/
+# But track these specific files/folders
+!.gitignore
+!test/
+!test/**
+!lcov.info
+!AUDIT_SCOPE.md
+!TEST_PROOF.md
+!README.md
