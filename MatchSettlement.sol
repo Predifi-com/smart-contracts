@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -16,9 +16,10 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
     bytes32 public constant BATCH_SIGNER_ROLE = keccak256("BATCH_SIGNER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
+    uint256 public constant MAX_DEADLINE_OFFSET = 1 hours;
+
     MarketRegistry public registry;
 
-    // EIP-712 type hashes
     bytes32 private constant FILL_TYPEHASH = keccak256(
         "Fill(bytes32 marketId,address buyer,address seller,uint256 quantity,uint256 price,uint256 fee,uint256 nonce)"
     );
@@ -29,22 +30,21 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
     );
 
     struct Fill {
-        bytes32 marketId;    // MarketRegistry market ID
-        address buyer;       // Buyer address
-        address seller;      // Seller address
-        uint256 quantity;    // Trade size
-        uint256 price;       // Price in basis points (0-9999)
-        uint256 fee;         // Fee amount (accounted on backend ledger)
-        uint256 nonce;       // Fill nonce for uniqueness
+        bytes32 marketId;
+        address buyer;
+        address seller;
+        uint256 quantity;
+        uint256 price;
+        uint256 fee;
+        uint256 nonce;
     }
 
     struct BatchSettlement {
-        uint256 batchId;     // Unique batch identifier
-        Fill[] fills;        // Array of fills to settle
-        uint256 deadline;    // Settlement deadline timestamp
+        uint256 batchId;
+        Fill[] fills;
+        uint256 deadline;
     }
 
-    // replay guards
     mapping(uint256 => bool) public processedBatches;
     mapping(bytes32 => mapping(uint256 => bool)) public processedFills;
 
@@ -83,7 +83,7 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
         __AccessControl_init();
         __ReentrancyGuard_init();
         __EIP712_init("PredifiMatchSettlement", "1");
-        __UUPSUpgradeable_init();
+
         __Pausable_init();
         if (admin == address(0)) revert ZeroAddress();
         if (_registry == address(0)) revert ZeroAddress();
@@ -93,17 +93,13 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
         _grantRole(PAUSER_ROLE,        admin);
     }
 
-    /**
-     * @notice Settle a batch of matched trades
-     * @param batch Batch settlement data
-     * @param signature EIP-712 signature from authorized signer
-     */
     function batchSettle(
         BatchSettlement calldata batch,
         bytes calldata signature
     ) external nonReentrant whenNotPaused {
         if (batch.fills.length == 0) revert EmptyBatch();
         if (block.timestamp > batch.deadline) revert DeadlineExpired();
+        if (batch.deadline > block.timestamp + MAX_DEADLINE_OFFSET) revert DeadlineExpired();
         if (processedBatches[batch.batchId]) revert BatchAlreadyProcessed();
 
         bytes32 structHash = _hashBatch(batch);
@@ -113,13 +109,12 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
 
         processedBatches[batch.batchId] = true;
 
-        uint256 totalVolume = 0;
-        uint256 totalFees = 0;
+        uint256 totalVolume;
+        uint256 totalFees;
 
         for (uint256 i = 0; i < batch.fills.length; i++) {
             Fill calldata fill = batch.fills[i];
             
-            // Validate and process fill
             _processFill(fill, batch.batchId);
             
             totalVolume += fill.quantity;
@@ -142,6 +137,7 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
             fill.buyer == address(0) || 
             fill.seller == address(0) ||
             fill.quantity == 0 ||
+            fill.price == 0 ||
             fill.price >= 10000) {
             revert InvalidFill();
         }
@@ -150,7 +146,6 @@ contract MatchSettlement is Initializable, AccessControlUpgradeable, ReentrancyG
 
         processedFills[fill.marketId][fill.nonce] = true;
 
-        // No USDC moves. Fee was already deducted on the backend ledger.
         registry.recordTrade(
             fill.marketId,
             fill.buyer,
