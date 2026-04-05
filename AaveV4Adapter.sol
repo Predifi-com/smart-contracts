@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IYieldAdapter} from "../interfaces/IYieldAdapter.sol";
 
-// v4 Spoke interface — reserve-id-based; approve the Spoke before supply(), use onBehalfOf = address(this).
 interface IAaveV4Spoke {
     function supply(uint256 reserveId, uint256 amount, address onBehalfOf)
         external returns (uint256 suppliedShares, uint256 suppliedAmount);
@@ -24,19 +23,11 @@ contract AaveV4Adapter is Ownable, IYieldAdapter {
     error ZeroAddress();
     error ZeroAmount();
 
-    /// @inheritdoc IYieldAdapter
     address public immutable override asset;
     IAaveV4Spoke public immutable spoke;
     uint256 public immutable reserveId;
     string private _name;
 
-    /**
-     * @param pool_       PredifiPool proxy — becomes Ownable owner.
-     * @param asset_      USDC (or other) address on this chain.
-     * @param spoke_      AAVE v4 Spoke proxy on this chain.
-     * @param reserveId_  Reserve ID for asset_ on this Spoke.
-     * @param name_       Human label, e.g. "AAVE v4 USDC (Base)".
-     */
     constructor(
         address pool_,
         address asset_,
@@ -53,12 +44,10 @@ contract AaveV4Adapter is Ownable, IYieldAdapter {
         _name     = name_;
     }
 
-    /// @inheritdoc IYieldAdapter
     function pool() external view override returns (address) {
         return owner();
     }
 
-    /// @inheritdoc IYieldAdapter
     function name() external view override returns (string memory) {
         return _name;
     }
@@ -73,7 +62,6 @@ contract AaveV4Adapter is Ownable, IYieldAdapter {
         emit YieldDeposited(amount, deposited());
     }
 
-    // pass type(uint256).max to exit the full position
     function withdraw(uint256 amount) external override onlyOwner {
         if (amount == 0) revert ZeroAmount();
 
@@ -83,7 +71,19 @@ contract AaveV4Adapter is Ownable, IYieldAdapter {
         emit YieldWithdrawn(received, deposited());
     }
 
-    /// @inheritdoc IYieldAdapter
+    function sync() external view override onlyOwner returns (uint256) {
+        return deposited();
+    }
+
+    function claimRewards(address rewardToken, bytes calldata) external override onlyOwner {
+        if (rewardToken == address(0)) revert ZeroAddress();
+
+        uint256 balance = IERC20(rewardToken).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(rewardToken).safeTransfer(owner(), balance);
+        }
+    }
+
     function deposited() public view override returns (uint256) {
         return spoke.getUserSuppliedAssets(reserveId, address(this));
     }
