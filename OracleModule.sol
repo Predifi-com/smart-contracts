@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -7,17 +7,18 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IStorkAggregator} from "./interfaces/IStorkAggregator.sol";
 import {MarketRegistry} from "./MarketRegistry.sol";
+import {IOracleConfigValidator} from "../interfaces/IOracleConfigValidator.sol";
 
-contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
+contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable, IOracleConfigValidator {
     bytes32 public constant RESOLVER_ROLE = keccak256("RESOLVER_ROLE");
     bytes32 public constant CONFIG_ROLE = keccak256("CONFIG_ROLE");
 
     struct SymbolConfig {
-        bytes32 assetId;        // Stork asset ID (e.g., keccak256("BTC/USD"))
-        uint32 maxAgeSec;       // Maximum allowable staleness for a read
-        uint16 twapWindowSec;   // +/- seconds around endsAt for TWAP calculation
-        uint64 disputeBuffer;   // Seconds after endsAt before resolution is allowed
-        uint8 targetDecimals;   // Normalize prices to this decimal precision
+        bytes32 assetId;
+        uint32 maxAgeSec;
+        uint16 twapWindowSec;
+        uint64 disputeBuffer;
+        uint8 targetDecimals;
     }
 
     struct PriceReading {
@@ -30,11 +31,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
     IStorkAggregator public stork;
     MarketRegistry public registry;
     
-    /// @dev Symbol configuration mapping: symbol => config
     mapping(bytes32 => SymbolConfig) public symbols;
-    
-    /// @dev Track resolved markets to prevent double resolution
-    mapping(bytes32 => bool) public resolvedMarkets;
 
     event OracleSet(
         bytes32 indexed marketId,
@@ -72,7 +69,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
     function initialize(address admin, address _stork, address _registry) public initializer {
         __AccessControl_init();
         __ReentrancyGuard_init();
-        __UUPSUpgradeable_init();
+
         if (admin == address(0) || _stork == address(0) || _registry == address(0)) {
             revert ZeroAddress();
         }
@@ -83,20 +80,13 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         registry = MarketRegistry(_registry);
     }
 
-    /**
-     * @notice Auto-resolve a market using Stork price feeds
-     * @param marketId MarketRegistry market ID
-     * @param reasonURI URI containing resolution evidence and reasoning
-     */
     function autoResolve(
         bytes32 marketId,
         string calldata reasonURI
     ) external onlyRole(RESOLVER_ROLE) nonReentrant {
-        if (resolvedMarkets[marketId]) revert AlreadyResolved();
-
         MarketRegistry.MarketConfig memory marketInfo = registry.getMarket(marketId);
+        if (marketInfo.resolved) revert AlreadyResolved();
 
-        // Validate market is ready for resolution
         bytes32 symbolHash = keccak256(bytes(marketInfo.assetSymbol));
         SymbolConfig memory config = symbols[symbolHash];
         
@@ -115,7 +105,6 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
             MarketRegistry.Outcome.NO;
 
         registry.resolveMarket(marketId, outcome, reasonURI);
-        resolvedMarkets[marketId] = true;
 
         emit OracleSet(
             marketId,
@@ -134,7 +123,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         if (_hasHistoricalSupport(config.assetId, endsAt)) {
             return _getHistoricalTwap(config, endsAt);
         }
-        return _getCurrentPrice(config);
+        return _getCurrentPrice(config, endsAt);
     }
 
     function _tryGetClosePrice(
@@ -144,7 +133,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         if (_hasHistoricalSupport(config.assetId, endsAt)) {
             return _tryGetHistoricalTwap(config, endsAt);
         }
-        return _tryGetCurrentPrice(config);
+        return _tryGetCurrentPrice(config, endsAt);
     }
 
     function _getHistoricalTwap(
@@ -152,9 +141,8 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         uint256 endsAt
     ) internal view returns (uint256) {
         uint256[] memory prices = new uint256[](3);
-        uint256 validCount = 0;
+        uint256 validCount;
 
-        // Read prices at three points around endsAt
         uint256[3] memory timestamps = [
             endsAt - config.twapWindowSec,
             endsAt,
@@ -165,8 +153,8 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
             try stork.atOrBefore(config.assetId, timestamps[i]) 
                 returns (int256 price, uint256 ts, uint8 decimals) {
                 
-                // Check staleness
-                uint256 age = block.timestamp > ts ? block.timestamp - ts : ts - block.timestamp;
+                if (ts > endsAt) continue;
+                uint256 age = endsAt - ts;
                 if (age <= config.maxAgeSec && price > 0) {
                     prices[validCount] = _scaleToTarget(
                         uint256(price),
@@ -176,7 +164,6 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
                     validCount++;
                 }
             } catch {
-                // Skip invalid readings
             }
         }
 
@@ -184,7 +171,6 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
             revert OracleUnavailable("No valid historical prices");
         }
 
-        // Return median of valid prices
         return _calculateMedian(prices, validCount);
     }
 
@@ -193,7 +179,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         uint256 endsAt
     ) internal view returns (bool ok, uint256 price) {
         uint256[] memory prices = new uint256[](3);
-        uint256 validCount = 0;
+        uint256 validCount;
         uint256[3] memory timestamps = [
             endsAt - config.twapWindowSec,
             endsAt,
@@ -204,7 +190,8 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
             try stork.atOrBefore(config.assetId, timestamps[i])
                 returns (int256 reading, uint256 ts, uint8 decimals)
             {
-                uint256 age = block.timestamp > ts ? block.timestamp - ts : ts - block.timestamp;
+                if (ts > endsAt) continue;
+                uint256 age = endsAt - ts;
                 if (age <= config.maxAgeSec && reading > 0) {
                     prices[validCount] = _scaleToTarget(
                         uint256(reading),
@@ -224,12 +211,17 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
     }
 
     function _getCurrentPrice(
-        SymbolConfig memory config
+        SymbolConfig memory config,
+        uint256 endsAt
     ) internal view returns (uint256) {
         try stork.latest(config.assetId) 
             returns (int256 price, uint256 ts, uint8 decimals) {
-            
-            uint256 age = block.timestamp - ts;
+
+            if (ts > endsAt) {
+                revert OracleUnavailable("Current price is newer than market close");
+            }
+
+            uint256 age = endsAt - ts;
             if (age > config.maxAgeSec) {
                 revert StalePrice(age, config.maxAgeSec);
             }
@@ -248,12 +240,17 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
     }
 
     function _tryGetCurrentPrice(
-        SymbolConfig memory config
+        SymbolConfig memory config,
+        uint256 endsAt
     ) internal view returns (bool ok, uint256 price) {
         try stork.latest(config.assetId)
             returns (int256 reading, uint256 ts, uint8 decimals)
         {
-            uint256 age = block.timestamp - ts;
+            if (ts > endsAt) {
+                return (false, 0);
+            }
+
+            uint256 age = endsAt - ts;
             if (age > config.maxAgeSec || reading <= 0) {
                 return (false, 0);
             }
@@ -274,7 +271,6 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         if (count == 1) return prices[0];
         if (count == 2) return (prices[0] + prices[1]) / 2;
 
-        // Sort first 3 elements for median calculation
         if (prices[0] > prices[1]) {
             (prices[0], prices[1]) = (prices[1], prices[0]);
         }
@@ -285,7 +281,7 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
             (prices[0], prices[1]) = (prices[1], prices[0]);
         }
 
-        return prices[1]; // Middle value
+        return prices[1];
     }
 
     function _scaleToTarget(
@@ -315,7 +311,8 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         SymbolConfig calldata config
     ) external onlyRole(CONFIG_ROLE) {
         if (config.assetId == bytes32(0) || 
-            config.maxAgeSec == 0 || 
+            config.maxAgeSec == 0 ||
+            config.disputeBuffer == 0 ||
             config.targetDecimals > 18) {
             revert InvalidSymbolConfig();
         }
@@ -346,7 +343,11 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         return symbols[keccak256(bytes(symbol))];
     }
 
-    /// @notice Preview what the outcome would be if resolved now (read-only).
+    function getSymbolValidation(string calldata symbol) external view returns (bool supported, uint8 targetDecimals) {
+        SymbolConfig memory config = symbols[keccak256(bytes(symbol))];
+        return (config.assetId != bytes32(0), config.targetDecimals);
+    }
+
     function previewResolution(
         bytes32 marketId
     ) external view returns (
@@ -355,11 +356,10 @@ contract OracleModule is Initializable, AccessControlUpgradeable, ReentrancyGuar
         bool canResolve,
         bool alreadyResolved
     ) {
-        if (resolvedMarkets[marketId]) {
+        MarketRegistry.MarketConfig memory marketInfo = registry.getMarket(marketId);
+        if (marketInfo.resolved) {
             return (MarketRegistry.Outcome.INVALID, 0, false, true);
         }
-
-        MarketRegistry.MarketConfig memory marketInfo = registry.getMarket(marketId);
         bytes32 symbolHash = keccak256(bytes(marketInfo.assetSymbol));
         SymbolConfig memory config = symbols[symbolHash];
 
