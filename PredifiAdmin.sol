@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -8,12 +8,14 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 
 contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
     uint256 public constant DEFAULT_UPGRADE_DELAY = 1 days;
+    uint256 public constant MIN_UPGRADE_DELAY     = 6 hours;
 
-    // Roles
+    bytes4 private constant UPGRADE_TO_AND_CALL_SELECTOR = bytes4(keccak256("upgradeToAndCall(address,bytes)"));
+    bytes4 private constant UPGRADE_TO_SELECTOR          = bytes4(keccak256("upgradeTo(address)"));
+
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
-    // Governed contract registry
     struct GovernedContract {
         string  name;
         bool    active;
@@ -24,7 +26,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
     uint256 public upgradeDelay;
     mapping(bytes32 => uint256) public scheduledUpgradeTime;
 
-    // Events
     event ContractRegistered(address indexed proxy, string name);
     event ContractUnregistered(address indexed proxy);
     event Executed(address indexed target, bytes4 selector);
@@ -35,7 +36,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
     event ProtocolPaused(address indexed by);
     event ProtocolUnpaused(address indexed by);
 
-    // Errors
     error NotGoverned(address target);
     error AlreadyRegistered(address target);
     error NotRegistered(address target);
@@ -43,23 +43,17 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
     error ArrayLengthMismatch();
     error ZeroAddress();
     error DefaultAdminRoleProtected();
+    error UpgradeCallBlocked();
     error InvalidUpgradeDelay();
     error UpgradeNotQueued(bytes32 upgradeId);
     error UpgradeTooEarly(bytes32 upgradeId, uint256 executeAfter);
 
-    // init
-
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
 
-    /**
-     * @param admin           Becomes DEFAULT_ADMIN_ROLE — use Safe multisig on mainnet.
-     * @param operatorWallet  Backend hot wallet — gets OPERATOR_ROLE.
-     */
     function initialize(address admin, address operatorWallet) public initializer {
         __AccessControl_init();
         __ReentrancyGuard_init();
-        __UUPSUpgradeable_init();
 
         if (admin == address(0)) revert ZeroAddress();
 
@@ -72,12 +66,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         }
     }
 
-    // Governed contract management
-
-    /**
-     * @notice Register a governed contract so it can be called via execute().
-     * @dev Only DEFAULT_ADMIN_ROLE. Called once per contract at deploy time.
-     */
     function registerContract(address proxy, string calldata name)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -99,16 +87,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         return _contractList;
     }
 
-    // Execute
-
-    /**
-     * @notice Execute an arbitrary call on a governed contract.
-     * @dev DEFAULT_ADMIN_ROLE only. Intended for the Safe multisig.
-     *      Covers any operation not explicitly exposed as a helper below.
-     * @param target  Must be a registered governed contract.
-     * @param data    ABI-encoded calldata.
-     * @return result Raw return bytes.
-     */
     function execute(address target, bytes calldata data)
         external
         nonReentrant
@@ -116,16 +94,16 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         returns (bytes memory result)
     {
         if (!governedContracts[target].active) revert NotGoverned(target);
+        bytes4 sel = _selector(data);
+        if (sel == UPGRADE_TO_AND_CALL_SELECTOR || sel == UPGRADE_TO_SELECTOR) {
+            revert UpgradeCallBlocked();
+        }
         bool ok;
         (ok, result) = target.call(data);
         if (!ok) revert CallFailed(target, result);
-        emit Executed(target, _selector(data));
+        emit Executed(target, sel);
     }
 
-    /**
-     * @notice Execute multiple calls on governed contracts in one transaction.
-     * @dev DEFAULT_ADMIN_ROLE only. targets[i] and data[i] must correspond.
-     */
     function batchExecute(
         address[] calldata targets,
         bytes[]   calldata data
@@ -139,6 +117,10 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         results = new bytes[](targets.length);
         for (uint256 i = 0; i < targets.length; i++) {
             if (!governedContracts[targets[i]].active) revert NotGoverned(targets[i]);
+            bytes4 sel = _selector(data[i]);
+            if (sel == UPGRADE_TO_AND_CALL_SELECTOR || sel == UPGRADE_TO_SELECTOR) {
+                revert UpgradeCallBlocked();
+            }
             bool ok;
             (ok, results[i]) = targets[i].call(data[i]);
             if (!ok) revert CallFailed(targets[i], results[i]);
@@ -146,10 +128,8 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         emit BatchExecuted(targets.length);
     }
 
-    // Upgrade helpers
-
     function setUpgradeDelay(uint256 newDelay) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newDelay == 0) revert InvalidUpgradeDelay();
+        if (newDelay < MIN_UPGRADE_DELAY) revert InvalidUpgradeDelay();
         emit UpgradeDelayUpdated(upgradeDelay, newDelay);
         upgradeDelay = newDelay;
     }
@@ -177,13 +157,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         emit UpgradeQueued(upgradeId, proxy, newImpl, executeAfter);
     }
 
-    /**
-     * @notice Upgrade a governed UUPS contract to a new implementation.
-     * @dev UPGRADER_ROLE. All governed contracts expose upgradeToAndCall().
-     * @param proxy    The proxy address (must be registered).
-     * @param newImpl  New implementation address.
-     * @param callData Optional init data to call on the new implementation.
-     */
     function upgradeContract(
         address proxy,
         address newImpl,
@@ -214,13 +187,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         emit ContractUpgraded(proxy, newImpl);
     }
 
-    // Operational helpers (OPERATOR_ROLE)
-
-    /**
-     * @notice Grant a role on a governed contract.
-     * @dev OPERATOR_ROLE. Used for key rotation (new backend wallet, etc.).
-     *      Cannot grant DEFAULT_ADMIN_ROLE — that requires multisig via execute().
-     */
     function grantContractRole(
         address target,
         bytes32 role,
@@ -231,16 +197,13 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
     {
         if (!governedContracts[target].active) revert NotGoverned(target);
         if (role == DEFAULT_ADMIN_ROLE) revert DefaultAdminRoleProtected();
+        if (role == UPGRADER_ROLE || role == OPERATOR_ROLE) revert DefaultAdminRoleProtected();
         (bool ok, bytes memory result) = target.call(
             abi.encodeWithSignature("grantRole(bytes32,address)", role, account)
         );
         if (!ok) revert CallFailed(target, result);
     }
 
-    /**
-     * @notice Revoke a role on a governed contract.
-     * @dev OPERATOR_ROLE.
-     */
     function revokeContractRole(
         address target,
         bytes32 role,
@@ -269,11 +232,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         if (!ok) revert CallFailed(settlement, result);
     }
 
-    /**
-     * @notice Pause PredifiPool (emergency halt on all deposits + withdrawals).
-     * @dev DEFAULT_ADMIN_ROLE only — pausing the vault is a severe action.
-     * @param pool  Address of the PredifiPool proxy.
-     */
     function pausePool(address pool) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!governedContracts[pool].active) revert NotGoverned(pool);
         (bool ok, bytes memory result) = pool.call(abi.encodeWithSignature("pause()"));
@@ -281,10 +239,6 @@ contract PredifiAdmin is Initializable, AccessControlUpgradeable, ReentrancyGuar
         emit ProtocolPaused(msg.sender);
     }
 
-    /**
-     * @notice Unpause PredifiPool.
-     * @dev DEFAULT_ADMIN_ROLE only.
-     */
     function unpausePool(address pool) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!governedContracts[pool].active) revert NotGoverned(pool);
         (bool ok, bytes memory result) = pool.call(abi.encodeWithSignature("unpause()"));
