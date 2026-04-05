@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -23,34 +23,15 @@ contract PredifiPool is
 
     IERC20 public asset;
 
-    // Yield adapter registry
-
-    /// @notice Registered yield adapters. Each adapter handles one protocol/chain.
     address[] public yieldAdapters;
 
-    /// @notice Quick membership check: adapter address → registered.
     mapping(address => bool) public isYieldAdapter;
 
-    /// @notice Maximum number of adapters to bound the gas cost of totalBalance().
     uint256 public constant MAX_YIELD_ADAPTERS = 5;
 
-    // Yield snapshot
-
-    /**
-     * @notice TVL at the time of the last yield distribution snapshot.
-     * @dev The off-chain ledger polls totalBalance() and compares it against
-     *      this value to compute yieldDelta = totalBalance() - lastTVLSnapshot.
-     *      Updated by takeYieldSnapshot() after each distribution cycle.
-     */
     uint256 public lastTVLSnapshot;
 
-    /**
-     * @notice Block number when lastTVLSnapshot was recorded.
-     * @dev Provides the ledger a deterministic timestamp anchor.
-     */
     uint256 public lastSnapshotBlock;
-
-    // Events
 
     event Deposited(address indexed from, uint256 amount);
     event Withdrawn(address indexed to, uint256 amount, address indexed authorizedBy);
@@ -63,8 +44,6 @@ contract PredifiPool is
     event DeployedToYield(address indexed adapter, uint256 amount, uint256 totalInYield);
     event WithdrawnFromYield(address indexed adapter, uint256 amount, uint256 totalInYield);
     event TVLSnapshotTaken(uint256 tvl, uint256 blockNumber);
-
-    // Errors
 
     error ZeroAddress();
     error ZeroAmount();
@@ -81,14 +60,8 @@ contract PredifiPool is
         _disableInitializers();
     }
 
-    /**
-     * @notice Initialize the vault.
-     * @param asset_ The underlying asset (USDC).
-     * @param admin_ Address granted DEFAULT_ADMIN_ROLE, PAUSER_ROLE, LEDGER_ROLE.
-     *               On production this should be the PredifiAdmin proxy.
-     */
     function initialize(address asset_, address admin_) public initializer {
-        __UUPSUpgradeable_init();
+
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
@@ -103,9 +76,6 @@ contract PredifiPool is
         _grantRole(LEDGER_ROLE, admin_);
         _grantRole(YIELD_MANAGER_ROLE, admin_);
 
-        // Hedera: associate with HTS token. HTS entity IDs are always < 2^32 so the
-        // uint160 < uint32.max check distinguishes them from random EVM addresses.
-        // Soft-fail on testnet (296), hard-fail on mainnet (295).
         bool isHtsToken = uint160(asset_) < type(uint32).max;
         if ((block.chainid == 295 || block.chainid == 296) && isHtsToken) {
             (bool success, ) = address(0x167).call(
@@ -125,12 +95,6 @@ contract PredifiPool is
         emit Deposited(msg.sender, amount);
     }
 
-    /**
-     * @notice Withdraw assets from the vault
-     * @dev Only callable by authorized ledger service. Can send to ANY address.
-     * @param to Destination address (can be different from depositor)
-     * @param amount Amount to withdraw
-     */
     function withdraw(
         address to,
         uint256 amount
@@ -144,14 +108,6 @@ contract PredifiPool is
         emit Withdrawn(to, amount, msg.sender);
     }
 
-    // Yield adapter management
-
-    /**
-     * @notice Register a yield adapter for idle liquidity deployment.
-     * @dev DEFAULT_ADMIN_ROLE only. Adapter's asset() must match pool's asset.
-     *      Max MAX_YIELD_ADAPTERS adapters to cap gas cost of totalBalance().
-     * @param adapter Deployed IYieldAdapter contract address.
-     */
     function registerYieldAdapter(address adapter) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (adapter == address(0))                revert ZeroAddress();
         if (isYieldAdapter[adapter])              revert AdapterAlreadyRegistered(adapter);
@@ -168,12 +124,6 @@ contract PredifiPool is
         emit YieldAdapterRegistered(adapter, IYieldAdapter(adapter).name());
     }
 
-    /**
-     * @notice Remove a yield adapter. Any deployed funds must be withdrawn first.
-     * @dev DEFAULT_ADMIN_ROLE only. Call withdrawFromYield() before removing
-     *      if the adapter has an active position.
-     * @param adapter Adapter address to remove.
-     */
     function removeYieldAdapter(address adapter) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!isYieldAdapter[adapter]) revert AdapterNotRegistered(adapter);
 
@@ -182,7 +132,6 @@ contract PredifiPool is
 
         isYieldAdapter[adapter] = false;
 
-        // Remove from array (swap-and-pop)
         uint256 len = yieldAdapters.length;
         for (uint256 i = 0; i < len; i++) {
             if (yieldAdapters[i] == adapter) {
@@ -195,13 +144,6 @@ contract PredifiPool is
         emit YieldAdapterRemoved(adapter);
     }
 
-    /**
-     * @notice Deploy idle USDC into a yield adapter.
-     * @dev LEDGER_ROLE only. The ledger decides when/how much to deploy based on
-     *      the predicted minimum float needed to service withdrawals.
-     * @param adapter Registered IYieldAdapter to use.
-     * @param amount  Amount of USDC to deploy. Must be <= spot balance.
-     */
     function deployToYield(
         address adapter,
         uint256 amount
@@ -216,13 +158,6 @@ contract PredifiPool is
         emit DeployedToYield(adapter, amount, yieldBalance());
     }
 
-    /**
-     * @notice Retrieve USDC from a yield adapter back to this pool.
-     * @dev LEDGER_ROLE only. Call before withdraw() if spot balance is insufficient.
-     *      Pass `type(uint256).max` to exit the full adapter position.
-     * @param adapter Registered IYieldAdapter to pull from.
-     * @param amount  Amount of underlying asset to withdraw from the adapter.
-     */
     function withdrawFromYield(
         address adapter,
         uint256 amount
@@ -235,14 +170,6 @@ contract PredifiPool is
         emit WithdrawnFromYield(adapter, amount, yieldBalance());
     }
 
-    // View functions
-
-    /**
-     * @notice Total assets controlled by this pool: spot balance + all yield positions.
-     * @dev This is the canonical TVL figure the off-chain ledger uses to compute
-     *      per-user balances and yield allocations.
-     * @return Spot USDC + sum of adapter.deposited() across all registered adapters.
-     */
     function totalBalance() external view returns (uint256) {
         return _totalBalance();
     }
@@ -256,12 +183,8 @@ contract PredifiPool is
         return total;
     }
 
-    /**
-     * @notice Sum of assets currently deployed across all yield adapters.
-     * @return Total yield-deployed balance (principal + accrued yield).
-     */
     function yieldBalance() public view returns (uint256) {
-        uint256 total = 0;
+        uint256 total;
         uint256 len = yieldAdapters.length;
         for (uint256 i = 0; i < len; i++) {
             total += IYieldAdapter(yieldAdapters[i]).deposited();
@@ -269,17 +192,6 @@ contract PredifiPool is
         return total;
     }
 
-    /**
-     * @notice Snapshot the current TVL as the yield-distribution baseline.
-     * @dev Called by the LEDGER_ROLE backend AFTER distributing yield to users.
-     *      Sets lastTVLSnapshot = totalBalance() so the next snapshot captures only
-     *      yield that accrued AFTER this point.
-     *
-     *      Typical ledger cycle:
-     *        1. yieldDelta = totalBalance() - lastTVLSnapshot   (off-chain)
-     *        2. distribute yieldDelta to users                   (off-chain DB)
-     *        3. call takeYieldSnapshot()                         (on-chain anchor)
-     */
     function takeYieldSnapshot() external onlyRole(LEDGER_ROLE) {
         uint256 tvl = _totalBalance();
         lastTVLSnapshot  = tvl;
@@ -287,12 +199,6 @@ contract PredifiPool is
         emit TVLSnapshotTaken(tvl, block.number);
     }
 
-    /**
-     * @notice Yield that has accrued since the last snapshot.
-     * @dev Returns (currentTVL - lastTVLSnapshot), clamped to 0 to avoid
-     *      underflow if TVL somehow shrank (e.g. AAVE slashing scenario).
-     * @return Pending undistributed yield in asset base units.
-     */
     function pendingYield() external view returns (uint256) {
         uint256 current = _totalBalance();
         if (current <= lastTVLSnapshot) return 0;
