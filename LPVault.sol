@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.25;
+pragma solidity 0.8.25;
 
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
@@ -10,11 +10,10 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IYieldAdapter} from "../interfaces/IYieldAdapter.sol";
 import {IBridgeAdapter} from "../interfaces/IBridgeAdapter.sol";
-
-/// @notice Minimal WETH / WHBAR interface — wrap and unwrap native gas token.
 interface IWETH {
     function deposit()                             external payable;
     function withdraw(uint256 amount)              external;
@@ -29,25 +28,21 @@ contract LPVault is
     PausableUpgradeable
 {
     using SafeERC20 for IERC20;
-
-    // Roles
     bytes32 public constant PAUSER_ROLE         = keccak256("PAUSER_ROLE");
     bytes32 public constant BRIDGE_MANAGER_ROLE = keccak256("BRIDGE_MANAGER_ROLE");
     bytes32 public constant YIELD_MANAGER_ROLE  = keccak256("YIELD_MANAGER_ROLE");
-
-    // Constants
     uint256 public constant MAX_YIELD_ADAPTERS = 10;
-
-    // State
+    uint256 public constant DEFAULT_VALUATION_MAX_AGE = 15 minutes;
 
     mapping(uint32 => address) public bridgeAdapters;
     mapping(uint32 => mapping(address => bool)) public authorizedRecipients;
     address[] public yieldAdapters;
 
     mapping(address => bool) public isYieldAdapter;
-    uint256 public totalDeployedToYield;
-
-    // Dual-yield reward state
+    uint256 private _totalDeployedToYieldDeprecated;
+    uint256 public totalDeployedToBridge;
+    uint256 public valuationMaxAge;
+    uint256 public lastYieldSync;
 
     address public rewardToken;
     uint256 public rewardsDuration;
@@ -56,17 +51,18 @@ contract LPVault is
     uint256 public rewardDust;
     uint256 public lastUpdateTime;
     uint256 public rewardPerTokenStored;
+    uint256 public lastRewardNotificationBlock;
     mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
 
     address public nativeWrapper;
 
-    // Events
-
     event YieldAdapterAdded(address indexed adapter, string adapterName);
     event YieldAdapterRemoved(address indexed adapter);
     event YieldDeployed(address indexed adapter, uint256 amount, uint256 totalDeployed);
     event YieldWithdrawn(address indexed adapter, uint256 amountRequested, uint256 totalDeployed);
+    event YieldValuationSynced(address indexed adapter, uint256 deployedBalance, uint256 syncedAt);
+    event ValuationMaxAgeUpdated(uint256 maxAge);
 
     event BridgeAdapterSet(uint32 indexed domain, address oldAdapter, address newAdapter);
     event RecipientAuthorizationSet(uint32 indexed domain, address indexed recipient, bool authorized);
@@ -81,8 +77,6 @@ contract LPVault is
     event NativeWrapperSet(address indexed wrapper);
     event DepositedETH(address indexed receiver, uint256 ethAmount, uint256 shares);
     event WithdrawnETH(address indexed receiver, uint256 ethAmount, uint256 shares);
-
-    // Errors
 
     error ZeroAddress();
     error ZeroAmount();
@@ -102,8 +96,12 @@ contract LPVault is
     error NativeWrapperAlreadySet();
     error AssetIsNotWrapper();
     error ETHTransferFailed();
+    error RewardTokenIsAsset();
+    error NoRewardsToClaim();
+    error InvalidValuationMaxAge();
+    error StaleYieldValuation(uint256 lastSync, uint256 maxAge);
+    error RewardActionBlocked(uint256 rewardBlock);
 
-    /// @dev Checkpoints reward accumulator for `account` before any share balance changes.
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
         lastUpdateTime       = lastTimeRewardApplicable();
@@ -114,19 +112,9 @@ contract LPVault is
         _;
     }
 
-    // initializer
-
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
 
-    /**
-     * @notice Initialise the LP vault.
-     * @param asset_   Underlying ERC-20 (USDC).
-     * @param name_    Vault LP-token name, e.g. "Predifi LP USDC".
-     * @param symbol_  Vault LP-token symbol, e.g. "pdLP-USDC".
-     * @param admin_   Granted DEFAULT_ADMIN_ROLE + PAUSER_ROLE.
-     *                 Use PredifiAdmin proxy address in production.
-     */
     function initialize(
         IERC20 asset_,
         string memory name_,
@@ -138,13 +126,18 @@ contract LPVault is
 
         __ERC4626_init(asset_);
         __ERC20_init(name_, symbol_);
-        __UUPSUpgradeable_init();
+
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(PAUSER_ROLE,        admin_);
+        _grantRole(BRIDGE_MANAGER_ROLE, admin_);
+        _grantRole(YIELD_MANAGER_ROLE,  admin_);
+
+        valuationMaxAge = DEFAULT_VALUATION_MAX_AGE;
+        lastYieldSync = block.timestamp;
     }
 
     function _checkpointRewards(address account) private {
@@ -160,39 +153,63 @@ contract LPVault is
         super._update(from, to, value);
     }
 
-    // ERC-4626 overrides
+    function _decimalsOffset() internal pure override returns (uint8) { return 18; }
 
-    /// @notice Total assets: idle balance + all yield adapter positions.
+    function totalDeployedToYield() public view returns (uint256) {
+        return _currentYieldBalance();
+    }
+
     function totalAssets() public view override returns (uint256) {
-        uint256 total = IERC20(asset()).balanceOf(address(this));
-        uint256 len   = yieldAdapters.length;
-        for (uint256 i; i < len; ++i) {
-            total += IYieldAdapter(yieldAdapters[i]).deposited();
-        }
+        uint256 total = IERC20(asset()).balanceOf(address(this)) + _currentYieldBalance();
+        total += totalDeployedToBridge;
         return total;
     }
 
-    /// @notice Deposit assets and mint shares to receiver.
+    function _currentYieldBalance() internal view returns (uint256 total) {
+        uint256 len = yieldAdapters.length;
+        for (uint256 i; i < len; ++i) {
+            total += IYieldAdapter(yieldAdapters[i]).deposited();
+        }
+    }
+
     function deposit(
         uint256 assets,
         address receiver
     ) public override nonReentrant whenNotPaused returns (uint256 shares) {
         if (assets   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
         return super.deposit(assets, receiver);
     }
 
-    /// @notice Mint exact shares, depositing required assets.
     function mint(
         uint256 shares,
         address receiver
     ) public override nonReentrant whenNotPaused returns (uint256 assets) {
         if (shares   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
         return super.mint(shares, receiver);
     }
 
-    /// @notice Withdraw assets to receiver by burning owner's shares.
+    function maxDeposit(address) public view override returns (uint256) {
+        return paused() ? 0 : type(uint256).max;
+    }
+
+    function maxMint(address) public view override returns (uint256) {
+        return paused() ? 0 : type(uint256).max;
+    }
+
+    function maxWithdraw(address owner_) public view override returns (uint256) {
+        return paused() ? 0 : super.maxWithdraw(owner_);
+    }
+
+    function maxRedeem(address owner_) public view override returns (uint256) {
+        return paused() ? 0 : super.maxRedeem(owner_);
+    }
+
     function withdraw(
         uint256 assets,
         address receiver,
@@ -201,13 +218,13 @@ contract LPVault is
         if (assets   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
 
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
-        if (assets > idle) revert InsufficientIdle(assets, idle);
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
+        _ensureIdle(assets);
 
         return super.withdraw(assets, receiver, owner);
     }
 
-    /// @notice Redeem shares for assets.
     function redeem(
         uint256 shares,
         address receiver,
@@ -216,16 +233,63 @@ contract LPVault is
         if (shares   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
 
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
         uint256 expectedAssets = previewRedeem(shares);
-        uint256 idle           = IERC20(asset()).balanceOf(address(this));
-        if (expectedAssets > idle) revert InsufficientIdle(expectedAssets, idle);
+        _ensureIdle(expectedAssets);
 
         return super.redeem(shares, receiver, owner);
     }
 
-    // Yield management
+    function _syncAllYieldAdapters() internal {
+        uint256 len = yieldAdapters.length;
+        for (uint256 i; i < len; ++i) {
+            _syncYieldAdapter(yieldAdapters[i]);
+        }
+    }
 
-    /// @notice Deploy idle USDC into a yield adapter. YIELD_MANAGER_ROLE only.
+    function _ensureIdle(uint256 requiredAssets) internal {
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        if (idle >= requiredAssets) return;
+
+        uint256 len = yieldAdapters.length;
+        for (uint256 i; i < len && idle < requiredAssets; ++i) {
+            address adapter = yieldAdapters[i];
+            uint256 inAdapter = IYieldAdapter(adapter).deposited();
+            if (inAdapter == 0) continue;
+
+            uint256 shortfall = requiredAssets - idle;
+            uint256 toRecall = inAdapter < shortfall ? inAdapter : shortfall;
+            IYieldAdapter(adapter).withdraw(toRecall);
+            idle = IERC20(asset()).balanceOf(address(this));
+        }
+
+        if (yieldAdapters.length != 0) {
+            lastYieldSync = block.timestamp;
+        }
+
+        if (idle < requiredAssets) revert InsufficientIdle(requiredAssets, idle);
+    }
+
+    function _syncYieldAdapter(address adapter) internal returns (uint256 deployedBalance) {
+        deployedBalance = IYieldAdapter(adapter).sync();
+        lastYieldSync = block.timestamp;
+        emit YieldValuationSynced(adapter, deployedBalance, block.timestamp);
+    }
+
+    function syncYieldAdapters() external onlyRole(YIELD_MANAGER_ROLE) nonReentrant returns (uint256 totalDeployed) {
+        uint256 len = yieldAdapters.length;
+        for (uint256 i; i < len; ++i) {
+            totalDeployed += _syncYieldAdapter(yieldAdapters[i]);
+        }
+    }
+
+    function setValuationMaxAge(uint256 maxAge) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (maxAge == 0) revert InvalidValuationMaxAge();
+        valuationMaxAge = maxAge;
+        emit ValuationMaxAgeUpdated(maxAge);
+    }
+
     function deployToYield(
         address adapter,
         uint256 amount
@@ -238,12 +302,12 @@ contract LPVault is
 
         IERC20(asset()).forceApprove(adapter, amount);
         IYieldAdapter(adapter).deposit(amount);
-        totalDeployedToYield += amount;
 
-        emit YieldDeployed(adapter, amount, totalDeployedToYield);
+        uint256 totalDeployed = _syncYieldAdapter(adapter);
+
+        emit YieldDeployed(adapter, amount, totalDeployed);
     }
 
-    /// @notice Pull back funds from a yield adapter. YIELD_MANAGER_ROLE only.
     function withdrawFromYield(
         address adapter,
         uint256 amount
@@ -256,17 +320,12 @@ contract LPVault is
         if (toRecall == 0)                 revert InsufficientYield(amount, 0);
 
         IYieldAdapter(adapter).withdraw(toRecall);
-        // totalDeployedToYield tracks principal; yield > principal is possible
-        if (toRecall <= totalDeployedToYield) {
-            totalDeployedToYield -= toRecall;
-        } else {
-            totalDeployedToYield = 0;
-        }
 
-        emit YieldWithdrawn(adapter, toRecall, totalDeployedToYield);
+        uint256 totalDeployed = _syncYieldAdapter(adapter);
+
+        emit YieldWithdrawn(adapter, toRecall, totalDeployed);
     }
 
-    /// @notice Register a yield adapter.
     function addYieldAdapter(address adapter) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (adapter == address(0))         revert ZeroAddress();
         if (isYieldAdapter[adapter])       revert YieldAdapterAlreadyExists(adapter);
@@ -274,6 +333,7 @@ contract LPVault is
 
         yieldAdapters.push(adapter);
         isYieldAdapter[adapter] = true;
+        lastYieldSync = block.timestamp;
 
         emit YieldAdapterAdded(adapter, IYieldAdapter(adapter).name());
     }
@@ -292,6 +352,7 @@ contract LPVault is
             }
         }
         isYieldAdapter[adapter] = false;
+        lastYieldSync = block.timestamp;
 
         emit YieldAdapterRemoved(adapter);
     }
@@ -301,18 +362,6 @@ contract LPVault is
         return yieldAdapters;
     }
 
-    // Bridge management (M2 EVM multi-chain)
-
-    /**
-     * @notice Bridge `amount` USDC to the mirror LPVault on another EVM chain.
-     * @dev BRIDGE_MANAGER_ROLE only. Reverts with NoBridgeAdapter on Hedera
-     *      (correct — Hedera LP capital stays on Hedera).
-     * @param destinationDomain  Circle CCTP domain ID of the destination chain.
-     * @param recipient          Mirror LPVault address on the destination chain.
-     * @param amount             Amount of USDC to bridge.
-     * @param bridgeData         Adapter-specific extra data (slippage, hooks, etc.).
-     * @return messageId         CCTP message hash for off-chain attestation tracking.
-     */
     function bridgeToVenue(
         uint32  destinationDomain,
         address recipient,
@@ -338,22 +387,19 @@ contract LPVault is
             bridgeData
         );
 
+        totalDeployedToBridge += amount;
         emit LiquidityBridged(destinationDomain, recipient, amount, messageId);
     }
 
-    /**
-     * @notice Acknowledgement hook called by backend after inbound CCTP mint.
-     * @dev USDC is already in the vault by the time this is called (CCTP mints
-     *      directly to this address). This function only emits an audit event.
-     */
-    function receiveFromVenue() external onlyRole(BRIDGE_MANAGER_ROLE) {
+    function receiveFromVenue(uint256 amount) external onlyRole(BRIDGE_MANAGER_ROLE) {
+        if (totalDeployedToBridge >= amount) {
+            totalDeployedToBridge -= amount;
+        } else {
+            totalDeployedToBridge = 0;
+        }
         emit LiquidityReceivedFromVenue(IERC20(asset()).balanceOf(address(this)));
     }
 
-    /**
-     * @notice Register or update the bridge adapter for a CCTP domain.
-     * @dev Set to address(0) to deregister.
-     */
     function setBridgeAdapter(
         uint32  destinationDomain,
         address adapter
@@ -363,10 +409,6 @@ contract LPVault is
         emit BridgeAdapterSet(destinationDomain, old, adapter);
     }
 
-    /**
-     * @notice Authorise or revoke a recipient on a destination domain.
-     * @dev Should always be the mirror LPVault proxy on that chain.
-     */
     function setAuthorizedRecipient(
         uint32  destinationDomain,
         address recipient,
@@ -377,33 +419,19 @@ contract LPVault is
         emit RecipientAuthorizationSet(destinationDomain, recipient, authorized);
     }
 
-    // Dual-yield reward distribution
-
-    /**
-     * @notice Set the secondary reward token and distribution window.
-     * @dev DEFAULT_ADMIN_ROLE only. Can only be called once — revert if already set.
-     *      To support multiple reward tokens in future, upgrade the contract.
-     * @param token_    ERC-20 address of the reward token (e.g. native governance token,
-     *                  or USDC when the vault's deposit asset is ETH/WETH).
-     * @param duration_ Length of each reward period in seconds (e.g. 7 days = 604800).
-     */
     function setRewardToken(
         address token_,
         uint256 duration_
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (token_    == address(0)) revert ZeroAddress();
         if (rewardToken != address(0)) revert RewardTokenAlreadySet();
+        if (token_ == asset())       revert RewardTokenIsAsset();
         if (duration_ == 0)          revert InvalidRewardsDuration();
         rewardToken      = token_;
         rewardsDuration  = duration_;
         emit RewardTokenSet(token_, duration_);
     }
 
-    /**
-     * @notice Update the reward distribution window for future periods.
-     * @dev DEFAULT_ADMIN_ROLE only. Cannot shorten an active period.
-     *      Safe to call only when periodFinish < block.timestamp.
-     */
     function setRewardsDuration(
         uint256 duration_
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -413,12 +441,12 @@ contract LPVault is
         emit RewardsDurationUpdated(duration_);
     }
 
-    /// @notice Inject rewards and start/extend the distribution period (Synthetix pattern).
     function notifyRewardAmount(
         uint256 amount
-    ) external onlyRole(YIELD_MANAGER_ROLE) updateReward(address(0)) {
+    ) external nonReentrant onlyRole(YIELD_MANAGER_ROLE) updateReward(address(0)) {
         if (rewardToken == address(0)) revert RewardTokenNotSet();
         if (amount == 0)               revert ZeroAmount();
+        if (totalSupply() == 0)        revert ZeroAmount();
 
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), amount);
 
@@ -437,8 +465,16 @@ contract LPVault is
 
         lastUpdateTime = block.timestamp;
         periodFinish   = block.timestamp + rewardsDuration;
+        lastRewardNotificationBlock = block.number;
 
         emit RewardAdded(amount, periodFinish);
+    }
+
+    function _enforceRewardActionCooldown() internal view {
+        uint256 rewardBlock = lastRewardNotificationBlock;
+        if (rewardBlock != 0 && block.number == rewardBlock) {
+            revert RewardActionBlocked(rewardBlock);
+        }
     }
 
     function claimRewards() external nonReentrant updateReward(msg.sender) {
@@ -459,22 +495,23 @@ contract LPVault is
     function rewardPerToken() public view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return rewardPerTokenStored;
+        uint256 scale = 10 ** (18 + _decimalsOffset());
         return rewardPerTokenStored
             + (lastTimeRewardApplicable() - lastUpdateTime)
             * rewardRate
-            * 1e18
+            * scale
             / supply;
     }
 
 
     function earned(address account) public view returns (uint256) {
+        uint256 scale = 10 ** (18 + _decimalsOffset());
         return balanceOf(account)
             * (rewardPerToken() - userRewardPerTokenPaid[account])
-            / 1e18
+            / scale
             + rewards[account];
     }
 
-    /// @notice Set the WETH/WHBAR wrapper contract once. Vault must have been initialised with it as asset_.
     function setNativeWrapper(address wrapper_) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (wrapper_      == address(0)) revert ZeroAddress();
         if (nativeWrapper != address(0)) revert NativeWrapperAlreadySet();
@@ -483,15 +520,14 @@ contract LPVault is
         emit NativeWrapperSet(wrapper_);
     }
 
-    /// @notice Wrap msg.value → WETH and deposit into vault, crediting shares to receiver.
-    /// previewDeposit must be called BEFORE wrapping to avoid share price inflation.
     function depositETH(address receiver) external payable nonReentrant whenNotPaused returns (uint256 shares) {
         if (nativeWrapper == address(0)) revert NativeWrapperNotSet();
         uint256 assets = msg.value;
         if (assets   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
 
-        // snapshot shares before wrap — IWETH.deposit inflates totalAssets
         shares = previewDeposit(assets);
         IWETH(nativeWrapper).deposit{value: assets}();
         _mint(receiver, shares);
@@ -500,7 +536,6 @@ contract LPVault is
         emit DepositedETH(receiver, assets, shares);
     }
 
-    /// @notice Burn shares, unwrap WETH → ETH and push to receiver.
     function withdrawETH(
         uint256 shares,
         address receiver,
@@ -510,9 +545,10 @@ contract LPVault is
         if (shares   == 0)            revert ZeroAmount();
         if (receiver == address(0))   revert ZeroAddress();
 
+        _enforceRewardActionCooldown();
+        _syncAllYieldAdapters();
         assets = previewRedeem(shares);
-        uint256 idle = IERC20(asset()).balanceOf(address(this));
-        if (assets > idle) revert InsufficientIdle(assets, idle);
+        _ensureIdle(assets);
 
         if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
 
@@ -523,6 +559,46 @@ contract LPVault is
 
         emit Withdraw(msg.sender, receiver, owner, assets, shares);
         emit WithdrawnETH(receiver, assets, shares);
+    }
+
+    function claimAdapterRewards(
+        address rewardAsset,
+        address recipient
+    ) external onlyRole(YIELD_MANAGER_ROLE) nonReentrant {
+        _claimAdapterRewards(address(0), rewardAsset, recipient, bytes(""));
+    }
+
+    function claimAdapterRewards(
+        address adapter,
+        address rewardAsset,
+        address recipient,
+        bytes calldata claimData
+    ) external onlyRole(YIELD_MANAGER_ROLE) nonReentrant {
+        _claimAdapterRewards(adapter, rewardAsset, recipient, claimData);
+    }
+
+    function _claimAdapterRewards(
+        address adapter,
+        address rewardAsset,
+        address recipient,
+        bytes memory claimData
+    ) internal {
+        if (rewardAsset == address(0)) revert ZeroAddress();
+        if (recipient   == address(0)) revert ZeroAddress();
+
+        if (adapter == address(0)) {
+            uint256 len = yieldAdapters.length;
+            for (uint256 i; i < len; ++i) {
+                IYieldAdapter(yieldAdapters[i]).claimRewards(rewardAsset, bytes(""));
+            }
+        } else {
+            if (!isYieldAdapter[adapter]) revert InvalidYieldAdapter(adapter);
+            IYieldAdapter(adapter).claimRewards(rewardAsset, claimData);
+        }
+
+        uint256 bal = IERC20(rewardAsset).balanceOf(address(this));
+        if (bal == 0) revert NoRewardsToClaim();
+        IERC20(rewardAsset).safeTransfer(recipient, bal);
     }
 
     receive() external payable {
